@@ -1,0 +1,21 @@
+root = "."
+
+tmp_dir = "tmp"
+
+[build]
+    poll = true          # 开启轮询检测，专门解决 Windows 挂载卷监听不到保存的问题
+    poll_interval = 500  # 每 500 毫秒扫描一次文件有没有改动
+    
+    cmd = "go build -o ./tmp/main ./cmd/apiserver"
+
+    bin = "./tmp/main"
+
+    delay = 1000
+
+    exclude_dir = ["assets", "tmp", "vendor", "testdata"]
+
+    include_ext = ["go", "yaml", "json"]
+
+[log]
+
+    time = true

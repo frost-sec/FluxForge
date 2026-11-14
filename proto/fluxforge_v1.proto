@@ -1,0 +1,205 @@
+syntax = "proto3";
+package fluxforge.v1;
+option go_package = "fluxforge-control/pkg/api/v1;fluxforgev1";
+service CatalogService {
+ rpc PublishFunction(PublishFunctionRequest) returns (PublishFunctionResponse);
+ rpc GetFunction(GetFunctionRequest) returns (GetFunctionResponse);
+ rpc PublishWorkflow(PublishWorkflowRequest) returns (PublishWorkflowResponse);
+ rpc GetWorkflow(GetWorkflowRequest) returns (GetWorkflowResponse);
+}
+service ObjectService {
+ rpc BeginUpload(BeginUploadRequest) returns (BeginUploadResponse);
+ rpc CommitUpload(CommitUploadRequest) returns (CommitUploadResponse);
+ rpc GetDownloadURL(GetDownloadURLRequest) returns (GetDownloadURLResponse);
+}
+service WorkflowService {
+ rpc SubmitRun(SubmitRunRequest) returns (SubmitRunResponse);
+ rpc GetRun(GetRunRequest) returns (GetRunResponse);
+ rpc CancelRun(CancelRunRequest) returns (CancelRunResponse);
+ rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+ rpc ListInvocations(ListInvocationsRequest) returns (ListInvocationsResponse);
+ rpc ListAttempts(ListAttemptsRequest) returns (ListAttemptsResponse);
+}
+service RunnerQueueService {
+ rpc RegisterRunner(RegisterRunnerRequest) returns (RegisterRunnerResponse);
+ rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+ rpc AcquireTasks(AcquireTasksRequest) returns (AcquireTasksResponse);
+ rpc ReportStarted(ReportStartedRequest) returns (ReportStartedResponse);
+ rpc ReportExecutionFinished(ReportExecutionFinishedRequest) returns (ReportExecutionFinishedResponse);
+ rpc RenewLeases(RenewLeasesRequest) returns (RenewLeasesResponse);
+ rpc ReportCompletion(ReportCompletionRequest) returns (ReportCompletionResponse);
+ rpc ReleaseTask(ReleaseTaskRequest) returns (ReleaseTaskResponse);
+ rpc ReportMetrics(ReportMetricsRequest) returns (ReportMetricsResponse);
+}
+service QueueAdminService {
+ rpc GetPoolSnapshot(GetPoolSnapshotRequest) returns (GetPoolSnapshotResponse);
+ rpc ListRunners(ListRunnersRequest) returns (ListRunnersResponse);
+ rpc SetRunnerPolicy(SetRunnerPolicyRequest) returns (SetRunnerPolicyResponse);
+ rpc GetSchedulingPolicy(GetPolicyRequest) returns (PolicyResponse);
+ rpc SetSchedulingPolicy(SetPolicyRequest) returns (PolicyResponse);
+ rpc GetAutoscalingPolicy(GetPolicyRequest) returns (PolicyResponse);
+ rpc SetAutoscalingPolicy(SetPolicyRequest) returns (PolicyResponse);
+}
+service ObservabilityService { rpc GetFunctionStats(GetFunctionStatsRequest) returns (GetFunctionStatsResponse); }
+enum RuntimeType { RUNTIME_UNSPECIFIED = 0; RUNTIME_CPP20 = 1; RUNTIME_GO122 = 2; RUNTIME_PYTHON311 = 3; }
+enum AttemptStatus {
+ ATTEMPT_STATUS_UNSPECIFIED = 0; ATTEMPT_STATUS_RUNNING = 1; ATTEMPT_STATUS_SUCCESS = 2;
+ ATTEMPT_STATUS_USER_FAILED = 3; ATTEMPT_STATUS_TIMEOUT = 4; ATTEMPT_STATUS_OOM = 5;
+ ATTEMPT_STATUS_CRASHED = 6; ATTEMPT_STATUS_CANCELLED = 7; ATTEMPT_STATUS_RESOURCE_ERROR = 8;
+ ATTEMPT_STATUS_INFRA_ERROR = 9; ATTEMPT_STATUS_LEASE_EXPIRED = 10;
+}
+enum RunnerStatePolicy { RUNNER_POLICY_ACTIVE = 0; RUNNER_POLICY_DRAINING = 1; RUNNER_POLICY_OFFLINE = 2; }
+message ObjectRef { string object_id = 1; int64 size_bytes = 2; string sha256 = 3; string content_type = 4; }
+message PayloadRef { oneof value { bytes inline_json = 1; ObjectRef object = 2; } }
+message TraceContext { string traceparent = 1; string tracestate = 2; }
+message FunctionSpec {
+ string function_id = 1; string version = 2; RuntimeType runtime = 3; string digest = 4;
+ string code_location = 5 [deprecated = true]; string entrypoint = 6;
+ string input_schema = 7; string output_schema = 8; int64 timeout_ms = 9; int64 memory_limit_bytes = 10;
+ ObjectRef artifact = 11; uint32 abi_version = 12; string architecture = 13;
+ int64 cpu_millis = 14; int64 slo_ms = 15; string runtime_digest = 16;
+}
+message FunctionRef { string function_id = 1; string version = 2; }
+message InputSource {
+ oneof source { bytes literal_json = 1; bool run_input = 2; string step_output = 3; }
+ string json_pointer = 4;
+}
+message InputFields { map<string,InputSource> fields = 1; }
+message InputBinding { oneof binding { InputSource source = 1; InputFields object_fields = 2; } }
+message BoundInput { PayloadRef payload = 1; string json_pointer = 2; }
+message BoundInputFields { map<string,BoundInput> fields = 1; }
+message InputPlan { oneof binding { BoundInput source = 1; BoundInputFields object_fields = 2; } }
+message RetryPolicy { int32 max_attempts = 1; int64 initial_backoff_ms = 2; int64 max_backoff_ms = 3; bool retry_user_errors = 4; }
+message WorkflowStep { string name = 1; FunctionRef function = 2; repeated string depends_on = 3; InputBinding input = 4; RetryPolicy retry = 5; }
+message WorkflowSpec { string workflow_id = 1; string version = 2; repeated WorkflowStep steps = 3; string output_step = 4; int64 default_slo_ms = 5; }
+message TaskAssignment {
+ string run_id = 1; string invocation_id = 2; string attempt_id = 3; string step_name = 4;
+ string affinity_key = 5; FunctionSpec function_spec = 6;
+ bytes input_payload = 7 [deprecated = true]; string input_s3_key = 8 [deprecated = true];
+ int64 deadline_unix_ms = 9; TaskLease initial_lease = 10;
+ InputPlan input_plan = 11; TraceContext trace_context = 12; int64 prepare_timeout_ms = 13; int64 created_unix_ms = 14;
+}
+message TaskLease {
+ string attempt_id = 1; string lease_token = 2; int64 lease_duration_ms = 3; int64 renew_interval_ms = 4;
+ int64 expires_unix_ms = 5; int64 server_unix_ms = 6;
+}
+message PublishFunctionRequest { FunctionSpec spec = 1; }
+message PublishFunctionResponse { bool success = 1; string message = 2; FunctionSpec spec = 3; }
+message GetFunctionRequest { string function_id = 1; string version = 2; }
+message GetFunctionResponse { FunctionSpec spec = 1; }
+message PublishWorkflowRequest { string workflow_id = 1 [deprecated = true]; string dag_json = 2 [deprecated = true]; WorkflowSpec spec = 3; }
+message PublishWorkflowResponse { bool success = 1; WorkflowSpec spec = 2; }
+message GetWorkflowRequest { string workflow_id = 1; string version = 2; }
+message GetWorkflowResponse { string workflow_id = 1; string dag_json = 2 [deprecated = true]; WorkflowSpec spec = 3; }
+message BeginUploadRequest { string purpose = 1; int64 size_bytes = 2; string sha256 = 3; string content_type = 4; string session_id = 5; string attempt_id = 6; }
+message BeginUploadResponse { string upload_id = 1; string url = 2; int64 expires_unix_ms = 3; map<string,string> headers = 4; }
+message CommitUploadRequest { string upload_id = 1; }
+message CommitUploadResponse { ObjectRef object = 1; }
+message GetDownloadURLRequest { string object_id = 1; string session_id = 2; string attempt_id = 3; }
+message GetDownloadURLResponse { string url = 1; int64 expires_unix_ms = 2; ObjectRef object = 3; }
+message SubmitRunRequest {
+ string workflow_id = 1; bytes input_payload = 2 [deprecated = true]; string idempotency_key = 3; int32 priority = 4;
+ string workflow_version = 5; PayloadRef input = 6; int64 slo_ms = 7; int64 deadline_unix_ms = 8; TraceContext trace_context = 9;
+}
+message SubmitRunResponse { string run_id = 1; string trace_id = 2; }
+message RunSummary {
+ string run_id = 1; string workflow_id = 2; string workflow_version = 3; string state = 4;
+ PayloadRef input = 5; PayloadRef output = 6; int32 priority = 7; int64 slo_ms = 8;
+ int64 created_unix_ms = 9; int64 finished_unix_ms = 10; int64 deadline_unix_ms = 11;
+ string error_message = 12; TraceContext trace_context = 13;
+}
+message GetRunRequest { string run_id = 1; }
+message GetRunResponse { string run_id = 1; string status = 2; bytes output_payload = 3 [deprecated = true]; RunSummary run = 4; }
+message CancelRunRequest { string run_id = 1; string reason = 2; }
+message CancelRunResponse { bool success = 1; string state = 2; }
+message ListRunsRequest { int32 limit = 1; string page_token = 2; string workflow_id = 3; string state = 4; }
+message ListRunsResponse { repeated RunSummary runs = 1; string next_page_token = 2; }
+message InvocationSummary {
+ string invocation_id = 1; string run_id = 2; string step_name = 3; FunctionRef function = 4;
+ string state = 5; int32 remaining_deps = 6; int32 attempt_count = 7;
+ int64 ready_unix_ms = 8; int64 started_unix_ms = 9; int64 finished_unix_ms = 10;
+ PayloadRef output = 11; string error_message = 12;
+}
+message ListInvocationsRequest { string run_id = 1; int32 limit = 2; string page_token = 3; }
+message ListInvocationsResponse { repeated InvocationSummary invocations = 1; string next_page_token = 2; }
+message AttemptSummary {
+ string attempt_id = 1; string invocation_id = 2; int32 number = 3; string session_id = 4; string state = 5;
+ int64 created_unix_ms = 6; int64 started_unix_ms = 7; int64 finished_unix_ms = 8;
+ int64 duration_ms = 9; string error_message = 10; PayloadRef output = 11;
+}
+message ListAttemptsRequest { string invocation_id = 1; int32 limit = 2; string page_token = 3; }
+message ListAttemptsResponse { repeated AttemptSummary attempts = 1; string next_page_token = 2; }
+message RegisterRunnerRequest {
+ string runner_id = 1; int64 boot_epoch = 2 [deprecated = true]; int32 max_slots = 3;
+ int64 memory_capacity_bytes = 4; repeated RuntimeType supported_runtimes = 5;
+ string boot_id = 6; int64 cpu_capacity_millis = 7; string container_id = 8;
+ string architecture = 9; string runtime_digest = 10;
+}
+message RegisterRunnerResponse { bool success = 1; int32 heartbeat_interval_sec = 2; RunnerStatePolicy policy = 3; string session_id = 4; }
+message HeartbeatRequest {
+ string runner_id = 1; int64 boot_epoch = 2 [deprecated = true]; int32 available_slots = 3;
+ int64 used_memory_bytes = 4; repeated string cached_affinity_keys = 5; string session_id = 6;
+ int32 active_attempts = 7; int32 pending_completions = 8; RunnerStatePolicy observed_policy = 9;
+}
+message HeartbeatResponse { bool acknowledged = 1; RunnerStatePolicy policy = 2; repeated string cancel_attempt_ids = 3; }
+message AcquireTasksRequest {
+ string runner_id = 1; int64 boot_epoch = 2 [deprecated = true]; int32 requested_slots = 3;
+ string request_id = 4; int64 wait_timeout_ms = 5; string session_id = 6;
+}
+message AcquireTasksResponse { repeated TaskAssignment tasks = 1; bool replayed = 2; repeated string expired_attempt_ids = 3; }
+message ReportStartedRequest { string runner_id = 1; string attempt_id = 2; string lease_token = 3; string session_id = 4; }
+message ReportStartedResponse { bool valid = 1; int64 execution_deadline_unix_ms = 2; int64 server_unix_ms = 3; }
+message ReportExecutionFinishedRequest { string session_id = 1; string attempt_id = 2; string lease_token = 3; int64 duration_ms = 4; }
+message ReportExecutionFinishedResponse { bool valid = 1; int64 upload_deadline_unix_ms = 2; int64 server_unix_ms = 3; }
+message LeaseRenewItem { string attempt_id = 1; string lease_token = 2; int64 extend_ms = 3 [deprecated = true]; }
+message LeaseRenewResult { string attempt_id = 1; bool valid = 2; string reason = 3; int64 expires_unix_ms = 4; int64 remaining_ms = 5; }
+message RenewLeasesRequest { string runner_id = 1; repeated LeaseRenewItem items = 2; string session_id = 3; }
+message RenewLeasesResponse {
+ repeated string renewed_attempt_ids = 1; repeated string revoked_attempt_ids = 2;
+ repeated LeaseRenewResult results = 3; int64 server_unix_ms = 4;
+}
+message StageTiming { string name = 1; int64 offset_ms = 2; int64 duration_ms = 3; }
+message ReportCompletionRequest {
+ string runner_id = 1; string attempt_id = 2; string lease_token = 3; AttemptStatus final_status = 4;
+ bytes output_payload = 5 [deprecated = true]; string output_s3_key = 6 [deprecated = true];
+ int64 duration_ms = 7; string error_message = 8; PayloadRef output = 9; string session_id = 10; repeated StageTiming stages = 11;
+}
+message ReportCompletionResponse { bool acknowledged = 1; bool is_duplicate = 2; }
+message ReleaseTaskRequest { string runner_id = 1; string attempt_id = 2; string lease_token = 3; string reason = 4; string session_id = 5; }
+message ReleaseTaskResponse { bool acknowledged = 1; }
+// Counts are non-cumulative bins, plus one +Inf bin. Units are seconds.
+message Histogram { repeated double bounds = 1; repeated uint64 counts = 2; uint64 count = 3; double sum = 4; }
+message FunctionMetrics {
+ string function_id = 1; string version = 2; string runtime_digest = 3; Histogram execution = 4;
+ uint64 errors = 5; uint64 cold_starts = 6; uint64 warm_starts = 7;
+}
+message ReportMetricsRequest { string runner_id = 1; string session_id = 2; uint64 sequence = 3; int64 observed_unix_ms = 4; repeated FunctionMetrics functions = 5; }
+message ReportMetricsResponse { bool accepted = 1; }
+message GetFunctionStatsRequest { string function_id = 1; string version = 2; int64 window_ms = 3; }
+message FunctionStats {
+ string function_id = 1; string version = 2; uint64 count = 3; double average_ms = 4;
+ double p50_ms = 5; double p95_ms = 6; double p99_ms = 7; uint64 errors = 8;
+ uint64 cold_starts = 9; uint64 warm_starts = 10; int64 updated_unix_ms = 11; int64 window_ms = 12;
+ uint64 invocation_count = 13; double invocation_average_ms = 14; double invocation_p50_ms = 15;
+ double invocation_p95_ms = 16; double invocation_p99_ms = 17; string runtime_digest = 18;
+}
+message GetFunctionStatsResponse { repeated FunctionStats functions = 1; }
+message GetPoolSnapshotRequest {}
+message GetPoolSnapshotResponse {
+ int32 ready_tasks_count = 1; int32 running_tasks_count = 2; int64 oldest_pending_age_ms = 3;
+ int32 total_active_slots = 4; int32 used_slots = 5; double estimated_drain_time_ms = 6;
+ int32 leased_tasks_count = 7; int32 completing_tasks_count = 8; int32 starting_runners = 9; int32 draining_runners = 10;
+}
+message RunnerSummary {
+ string runner_id = 1; string session_id = 2; RunnerStatePolicy policy = 3; string state = 4;
+ int32 max_slots = 5; int32 occupied_slots = 6; int64 last_seen_unix_ms = 7;
+ repeated string cached_affinity_keys = 8; string container_id = 9;
+ int32 active_attempts = 10; int32 pending_completions = 11; bool drain_acknowledged = 12;
+}
+message ListRunnersRequest {}
+message ListRunnersResponse { repeated RunnerSummary runners = 1; }
+message SetRunnerPolicyRequest { string runner_id = 1; RunnerStatePolicy policy = 2; }
+message SetRunnerPolicyResponse { bool success = 1; }
+message GetPolicyRequest {}
+message SetPolicyRequest { int64 expected_version = 1; bytes json = 2; }
+message PolicyResponse { int64 version = 1; bytes json = 2; }

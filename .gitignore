@@ -1,0 +1,11 @@
+**/build/
+**/build-agent/
+**/tmp/
+**/.cache/
+runner/include/proto/*.pb.*
+control/pkg/api/v1/*.pb.go
+.env
+artifacts/
+*.so
+*.log
+

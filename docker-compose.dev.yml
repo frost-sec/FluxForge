@@ -1,0 +1,69 @@
+version:  '3.8'
+
+networks:
+  fluxforge-net:
+    driver: bridge
+
+volumes:
+  pg_data:
+  minio_data:
+
+services:
+  #PostgreSQL For Statement Records
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ff-postgres
+    restart: always
+    environment:
+        POSTGRES_USER: fluxforge
+        POSTGRES_PASSWORD: password123
+        POSTGRES_DB: fluxforge
+
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - fluxforge-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: ff-minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+        MINIO_ROOT_USER: admin
+        MINIO_ROOT_PASSWORD: password123
+    
+    ports:
+      - "9000:9000" #S3 API
+      - "9001:9001" #Web控制台
+    volumes:
+      - minio_data:/data
+    networks:
+      - fluxforge-net
+    
+  control-plane:
+    build:
+        context: .
+        dockerfile: deploy/Dockerfile.control.dev
+    container_name: ff-control
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    environment:
+      - DB_DSN=host=postgres user=fluxforge password=password123 dbname=fluxforge port=5432 sslmode=disable
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+      # ★ 修正以下两处拼写错误
+      - DOCKER_API_VERSION=1.43
+      - RUNNER_IMAGE=fluxforge-runner:latest
+      - NETWORK_NAME=fluxforge_fluxforge-net
+    volumes:
+      - ./control:/app
+      - ./proto:/proto
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - fluxforge-net

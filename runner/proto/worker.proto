@@ -1,0 +1,13 @@
+syntax = "proto3";
+package fluxforge.worker.v1;
+
+// The outer envelope is stable across the Agent/Host/Worker processes. JSON
+// contains the operation-specific fields; identity is duplicated and checked
+// rather than trusting an unframed JSON object as a transport message.
+message WorkerEnvelope {
+  uint32 protocol_version = 1;
+  string correlation_id = 2;
+  string attempt_id = 3;
+  uint64 worker_generation = 4;
+  bytes json_body = 5;
+}

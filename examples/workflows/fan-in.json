@@ -1,0 +1,9 @@
+{
+ "workflowId":"fan-in-demo","version":"v1","defaultSloMs":"5000","outputStep":"D",
+ "steps":[
+  {"name":"A","function":{"functionId":"echo","version":"v1"},"input":{"source":{"runInput":true}}},
+  {"name":"B","function":{"functionId":"add","version":"v1"},"input":{"objectFields":{"fields":{"a":{"stepOutput":"A","jsonPointer":"/a"},"b":{"stepOutput":"A","jsonPointer":"/b"}}}}},
+  {"name":"C","function":{"functionId":"add","version":"v1"},"input":{"objectFields":{"fields":{"a":{"stepOutput":"A","jsonPointer":"/a"},"b":{"stepOutput":"A","jsonPointer":"/b"}}}}},
+  {"name":"D","function":{"functionId":"fan_in","version":"v1"},"input":{"objectFields":{"fields":{"left":{"stepOutput":"B"},"right":{"stepOutput":"C"}}}}}
+ ]
+}

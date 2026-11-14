@@ -1,0 +1,19 @@
+FROM fluxforge-toolchain:dev AS build
+COPY proto /workspace/proto
+COPY runner /workspace/runner
+COPY sdk /workspace/sdk
+COPY examples/functions /workspace/examples/functions
+RUN cmake -S /workspace/runner -B /build -DCMAKE_BUILD_TYPE=Release -DFF_BUILD_AGENT=ON -DBUILD_TESTING=ON && cmake --build /build -j 4 && ctest --test-dir /build --output-on-failure
+RUN mkdir -p /runtime/usr/local/bin /runtime/opt/fluxforge/examples /runtime/etc/ssl/certs /runtime/tmp && chmod 1777 /runtime/tmp \
+ && cp /build/fluxforge_runner /build/fluxforge-worker-host /build/fluxforge-worker /runtime/usr/local/bin/ \
+ && cp /build/examples/*.so /runtime/opt/fluxforge/examples/ \
+ && cp /etc/ssl/certs/ca-certificates.crt /runtime/etc/ssl/certs/ \
+ && for binary in /runtime/usr/local/bin/* /runtime/opt/fluxforge/examples/*.so; do ldd "$binary"; done > /tmp/ff-libs \
+ && awk '$2=="=>" {print $3} $1 ~ "^/" {print $1}' /tmp/ff-libs | sort -u | xargs -r -I{} cp -L --parents '{}' /runtime \
+ && cp -L --parents /lib64/ld-linux-x86-64.so.2 /runtime
+FROM scratch AS runtime
+COPY --from=build /runtime/ /
+ENV PATH=/usr/local/bin FF_WORK_DIR=/tmp/fluxforge FF_RUNTIME_DIGEST=cpp20-linux-amd64-v1 RUNNER_SLOTS=2 QUEUE_ADDR=control-plane:9091
+USER 65532:65532
+WORKDIR /tmp
+ENTRYPOINT ["/usr/local/bin/fluxforge_runner"]

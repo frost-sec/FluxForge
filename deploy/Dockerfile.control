@@ -1,0 +1,19 @@
+FROM fluxforge-go-tools:dev AS build
+WORKDIR /workspace
+COPY control/go.mod control/go.sum /workspace/control/
+RUN cd control && go mod download
+COPY control /workspace/control
+COPY proto /workspace/proto
+COPY scripts/codegen.sh /workspace/scripts/codegen.sh
+RUN bash scripts/codegen.sh && cd control && CGO_ENABLED=0 go build -trimpath -o /out/control ./cmd/apiserver && CGO_ENABLED=0 go build -trimpath -o /out/ffctl ./cmd/ffctl
+FROM scratch AS runtime
+COPY --from=build /out/ /usr/local/bin/
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+EXPOSE 8080 9090 9091
+ENTRYPOINT ["/usr/local/bin/control"]
+FROM fluxforge-runner-runtime:dev AS examples
+FROM runtime AS ffctl
+COPY --from=examples /opt/fluxforge/examples /workspace/runner/build/examples
+COPY examples/workflows /workspace/examples/workflows
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/ffctl"]

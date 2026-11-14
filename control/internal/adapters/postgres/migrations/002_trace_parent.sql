@@ -1,0 +1,2 @@
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS parent_span_id text NOT NULL DEFAULT '';
+INSERT INTO ff_schema_version(version) VALUES(2) ON CONFLICT DO NOTHING;

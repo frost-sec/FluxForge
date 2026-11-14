@@ -1,0 +1,11 @@
+.git
+papers
+**/*.md
+.vscode
+**/*.so
+**/build
+**/build-agent
+**/tmp
+**/.cache
+artifacts
+.env
