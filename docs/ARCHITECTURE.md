@@ -8,6 +8,6 @@ Lock order is Run -> Session -> sorted Invocation -> Attempt. Completion holds R
 
 Claim-check freezes MinIO object versions. API object IDs are opaque; the backend resolves stored locations, sizes and digests. Assignment contains reference-based InputPlans; Runner resolves and validates inputs. Upload completes before a successful Completion is committed.
 
-Runner owns RPC/lease/transfer state. A separate single-threaded Host creates clean Worker executables, then Workers load functions. Host owns process supervision and reaping. Docker resource limits constrain the full Runner; worker limits constrain wall time/address space/files/logs. This is a team-owned-code execution environment.
+Runner Agent owns RPC, leases and object transfers. Worker Host starts one Base-Zygote, which forks a Function-Zygote for each cached environment. The Function-Zygote loads its library and forks a fresh Worker for each Attempt. The Worker inherits the initialized pages and sends its result directly to Host over an independent UDS. Host supervises each child by pidfd. Docker budgets the full Runner, and Worker limits cover wall time, address space, files and logs. This is a team-owned-code execution environment.
 
 Run and Invocation latency include queuing/retries; execution histograms measure Worker calls only. Live backlog drives scaling; completed samples supply estimates. Soft SLO and hard deadline remain distinct. DRAINING is persisted before notification, and deletion requires both server lease accounting and Runner acknowledgment.

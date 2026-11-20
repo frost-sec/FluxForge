@@ -23,7 +23,7 @@ One modular Go control process: domain, catalog, workflow, execution, runnerregi
 - autoscaler: risk/desired capacity/reconciliation; Docker adapter only manages owned containers.
 - adapters: SQL and infrastructure APIs; transport: mapping/auth/validation/status only.
 
-C++ modules: app, control_client, attempt_manager, artifact_cache, payload_io, worker_client, worker_host, worker_runtime, ipc, telemetry. Separate sdk/cpp provides ABI/templates. Agent starts independent single-threaded Worker Host before gRPC threads. Host never loads user code; it fork/execs Workers, which load `.so` only after exec. A Worker handles one Attempt at a time and remains warm for matching environment keys.
+C++ modules: app, control_client, attempt_manager, artifact_cache, payload_io, worker_client, worker_host, worker_runtime, ipc, telemetry. Separate sdk/cpp provides ABI/templates. Agent starts the independent single-threaded Worker Host before gRPC threads. The November 21 runtime update replaces warm execution processes with the three-level Zygote tree below.
 
 Dependency direction is inward toward domain and focused ports; no cyclic business modules, universal managers, SQL in handlers or Docker calls in scheduler. Every module README describes purpose, current support, interfaces, dependencies, lifecycle/ownership, config, Docker tests and failures.
 
@@ -61,11 +61,15 @@ Reserve -> unlock -> PG Claim -> Commit/Abort reservation. No heap lock across D
 
 ## ABI, IPC and execution lifecycle
 
-C ABI exports ff_abi_version and ff_invoke_v1(call, output_writer, error_writer). Versioned structs, JSON pointer+length, Run/Invocation/Attempt IDs, host-owned writer callbacks. No STL/exceptions/allocator ownership across ABI; SDK catches exceptions. Matching code/runtime/ABI/resource configuration is the warm key. Recycle after limits/lifetime/memory growth; failed workers are destroyed.
+C ABI exports ff_abi_version and ff_invoke_v1(call, output_writer, error_writer). Versioned structs, JSON pointer+length, Run/Invocation/Attempt IDs, host-owned writer callbacks. No STL/exceptions/allocator ownership across ABI; SDK catches exceptions.
 
-UDS socketpair, 4-byte network-endian length + WorkerEnvelope protobuf; version/correlation/Attempt/generation. Messages cover warm/execute/terminate/drain/ready/result/exit. Bound frames and output queues, handle partial I/O/EINTR/EAGAIN/disconnect. Large local payloads use private temporary files, never credentials in worker.
+Host fork/execs the Worker binary once as Base-Zygote. The base loads the C++ runtime with an empty function cache and forks a Function-Zygote on an environment miss. The Function-Zygote loads the `.so` and checks its ABI once, then serves fork requests. A fresh Worker inherits the loaded state through copy-on-write, serves one Attempt, and exits with `_exit`. `prepare` parks this Worker before `ReportStarted`. The cache matches code/runtime/ABI affinity, local artifact path and resource limits. Active children pin their seed. At most one seed per slot is retained, with LRU eviction under pressure and 60s idle expiry.
 
-Host uses level-triggered epoll, monotonic timerfd, signalfd, waitpid drain and per-worker process groups. Timeout/cancel/revoked lease kills process group and reaps; callbacks do not perform unsafe asynchronous signal operations. Container init and parent-death cleanup handle orphaning. Docker CPU/memory/PID limits + worker RLIMIT_AS/FSIZE/NOFILE/CORE and bounded logs/files; RLIMIT_AS is not RSS and SIGKILL is not proof of OOM. No privileged/container cgroup delegation requirement. Scope is not a malicious multi-tenant sandbox.
+This is the C++ process adaptation of AFaaS tree-structured seeds in §4.3 of [Fork in the Road (OSDI ’25)](https://www.usenix.org/system/files/osdi25-chai-xiaohu.pdf).
+
+Agent/Host and Host/Worker use UDS streams, a 4-byte network-endian length and WorkerEnvelope protobuf with correlation/Attempt/generation. Host sends one endpoint of a dedicated Worker socketpair down the seed tree via `SCM_RIGHTS`. Worker results travel directly to Host. Bound frames and output queues, handle partial I/O/EINTR/EAGAIN/disconnect. Large local payloads use private temporary files. The Worker environment carries no control credentials.
+
+Host uses level-triggered epoll, monotonic timerfd and signalfd. Each child passes a pidfd to Host and waits for a launch grant. This lets Host cancel safely even during startup. Timeouts and cancellation of a leaf preserve its seed. Direct parents auto-reap children, and Host reaps adopted orphans. Parent-death signals link each process level. Docker CPU/memory/PID limits and RLIMIT_AS/FSIZE/NOFILE/CORE bound resources. Functions must be fork-safe, with single-threaded template initialization and no persistent external handles or subprocesses. Scope is team-owned code in one Runner container.
 
 Agent holds slot from assignment through final ACK/revocation. Independent heartbeats/acquire/renew/I/O. Preparation and upload have their own deadlines; actual function timeout excludes upload. Large result: ReportExecutionFinished -> upload -> Completion; small result may combine. Continue leases through preparation and result ACK. DRAINING stops acquisitions but preserves existing execution/renew/completion until drained.
 

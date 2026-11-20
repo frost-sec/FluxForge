@@ -2,6 +2,14 @@
 
 Accepted baseline: 2026-11-02. Verification updated 2026-11-03 (Asia/Hong_Kong). See IMPLEMENTATION_PLAN.md for the accepted contract.
 
+## Three-level Zygote update (2026-11-21)
+
+- Docker Runner release build passed CTest 2/2. The lifecycle test checked live process parent IDs, two concurrent Workers sharing one cold seed, one-shot exit and reaping, per-attempt state reset, and seed failure with a prepared Worker. Leaf timeout and cancellation preserve the seed.
+- The lifecycle test also ran as UID 65532 with a read-only root filesystem, dropped capabilities and container resource limits. The local 8 MiB fixture sample is recorded in [BENCHMARK.md](BENCHMARK.md#zygote-preparation-sample).
+- `ffctl verify` passed against the rebuilt image in the isolated `fluxforge-zygote-check` Compose project. The run covered MinIO transfer, crash retry, timeout, cancellation, handoff to result upload, fan-in with `value=10`, and latency metrics. Runner logs showed distinct Worker PIDs reusing the same seed across retries, and `docker top` after the run showed zero leaves.
+
+## Initial platform verification (2026-11-03)
+
 | Stage | Status | Evidence |
 | --- | --- | --- |
 | A: modules, contracts, Docker toolchain, docs | Implemented | Go/C++ tool and runtime images built; per-module READMEs; Compose validated |

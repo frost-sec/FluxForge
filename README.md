@@ -1,6 +1,6 @@
 # FluxForge
 
-Go 控制与调度、C++20 执行的函数计算与 DAG 工作流平台。PostgreSQL 保存权威执行状态；调度器使用可重建的分片内存队列；MinIO 保存函数制品和大输入输出；常驻 Worker 通过 UDS 执行版本化 C JSON ABI。
+Go 控制与调度、C++20 执行的函数计算与 DAG 工作流平台。PostgreSQL 保存权威执行状态，调度器使用可重建的分片内存队列，MinIO 保存函数制品和大输入输出。Runner 通过三层 Zygote 复用已加载的函数模板，每次调用由一次性 Worker 执行版本化 C JSON ABI。
 
 当前实现与验证证据见 [实施进度](docs/IMPLEMENTATION_STATUS.md)，完整约定见 [实施计划](docs/IMPLEMENTATION_PLAN.md)。未验证的性能、隔离或恢复能力不会被标记为完成。
 
@@ -82,4 +82,4 @@ docker compose -f compose.yml -f compose.observability.yml up -d
 
 ## 验证边界
 
-单元与并发测试运行在 Docker 中。PostgreSQL 集成测试使用随机命名的独立测试 schema，并且只清理自身 schema；端到端验证使用新部署，不操作旧数据卷。性能以实测报告为准；CPU/总内存由 Docker 限制，Worker 另有超时和地址空间等限制，进程复用不会自动清除函数全局状态。
+单元与并发测试运行在 Docker 中。PostgreSQL 集成测试使用随机命名的独立测试 schema，并且只清理自身 schema；端到端验证使用新部署，不操作旧数据卷。性能以实测报告为准。CPU 和总内存由 Docker 限制，Worker 另有超时和地址空间等限制。每次调用从函数模板继承初始化状态，调用期间对全局变量的写入随执行进程退出而丢弃。

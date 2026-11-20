@@ -14,6 +14,7 @@ class WorkerClient {
     std::unordered_map<std::string, std::promise<json>> promises_;
     std::thread reader_;
     std::atomic<uint64_t> sequence_{1};
+    std::atomic<bool> disconnected_{false};
 public:
     // Must be called before creating gRPC objects or threads.
     WorkerClient(const std::string& host, const std::string& worker, int slots) {
@@ -32,13 +33,25 @@ public:
         reader_ = std::thread([this] {
             try {
                 for (;;) { auto value = ipc::receive_blocking(fd_); auto id = value.at("id").get<std::string>(); std::lock_guard lock(promises_mutex_); auto it = promises_.find(id); if (it != promises_.end()) { it->second.set_value(std::move(value)); promises_.erase(it); } }
-            } catch (...) { std::lock_guard lock(promises_mutex_); for (auto& [id, promise] : promises_) promise.set_exception(std::current_exception()); promises_.clear(); }
+            } catch (...) {
+                std::lock_guard lock(promises_mutex_);
+                disconnected_ = true;
+                for (auto& [id, promise] : promises_) promise.set_exception(std::current_exception());
+                promises_.clear();
+            }
         });
     }
     std::future<json> request(json request) {
         auto id = std::to_string(sequence_++); request["id"] = id;
         std::promise<json> promise; auto future = promise.get_future();
-        { std::lock_guard lock(promises_mutex_); promises_.emplace(id, std::move(promise)); }
+        {
+            std::lock_guard lock(promises_mutex_);
+            if (disconnected_) {
+                promise.set_exception(std::make_exception_ptr(std::runtime_error("worker host disconnected")));
+                return future;
+            }
+            promises_.emplace(id, std::move(promise));
+        }
         try { std::lock_guard lock(send_mutex_); ipc::send_blocking(fd_, request); }
         catch (...) { std::lock_guard lock(promises_mutex_); auto it = promises_.find(id); if (it != promises_.end()) { it->second.set_exception(std::current_exception()); promises_.erase(it); } }
         return future;
@@ -46,6 +59,7 @@ public:
     std::future<json> invoke(json value) { value["op"] = "invoke"; return request(std::move(value)); }
     std::future<json> prepare(json value) { value["op"] = "prepare"; return request(std::move(value)); }
     std::future<json> stats() { return request({{"op", "stats"}}); }
+    bool disconnected() const { return disconnected_; }
     void cancel(const std::string& attempt_id, const std::string& reason) { std::lock_guard lock(send_mutex_); ipc::send_blocking(fd_, {{"op", "cancel"}, {"attempt_id", attempt_id}, {"reason", reason}}); }
     ~WorkerClient() {
         if (fd_ >= 0) { try { std::lock_guard lock(send_mutex_); ipc::send_blocking(fd_, {{"op", "shutdown"}}); } catch (...) {} shutdown(fd_, SHUT_RDWR); }

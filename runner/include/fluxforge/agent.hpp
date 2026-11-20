@@ -51,6 +51,7 @@ class Agent {
             auto stage_start=now_ms(); auto artifact = cache_.get(function.artifact(), *objects_, task.attempt_id(), alive); record_stage("artifact.fetch",stage_start);
             stage_start=now_ms(); InputResolver inputs(*objects_, directory, task.attempt_id(), config_.max_payload, alive); auto input = inputs.resolve(task.input_plan()); record_stage("input.resolve",stage_start);
             json request{{"attempt_id", task.attempt_id()}, {"run_id", task.run_id()}, {"invocation_id", task.invocation_id()}, {"affinity_key", task.affinity_key()}, {"library_path", artifact.path.string()}, {"input_path", input.string()}, {"output_path", (directory / "output.json").string()}, {"input_schema", function.input_schema()}, {"output_schema", function.output_schema()}, {"memory_limit_bytes", function.memory_limit_bytes()}, {"timeout_ms", function.timeout_ms()}, {"prepare_timeout_ms", std::max<int64_t>(1, preparing_until - now_ms())}, {"max_payload_bytes", config_.max_payload}};
+            request["require_prepared"] = true;
             stage_start=now_ms(); auto preparing = workers_.prepare(request); auto prepared = await(attempt, preparing, preparing_until); record_stage("worker.prepare",stage_start);
             if (prepared.value("status", "") != "PREPARED") throw std::runtime_error("worker preparation failed: " + prepared.value("error", "unknown") + " " + prepared.value("log_tail", ""));
             pb::ReportStartedRequest started; started.set_runner_id(config_.runner_id); started.set_session_id(session_); started.set_attempt_id(task.attempt_id()); started.set_lease_token(task.initial_lease().lease_token()); pb::ReportStartedResponse accepted;
@@ -78,7 +79,7 @@ class Agent {
                     if (object.object_id().empty()) throw std::runtime_error("upload deadline exceeded"); *completion.mutable_output()->mutable_object() = object; record_stage("output.upload",stage_start);
                 }
             }
-            log_event("attempt_executed", {{"attempt_id", task.attempt_id()}, {"run_id", task.run_id()}, {"invocation_id", task.invocation_id()}, {"worker_pid", result.value("worker_pid", 0)}, {"warm", result.value("warm", false)}, {"status", result.value("status", "CRASHED")}, {"duration_ms", completion.duration_ms()}, {"traceparent", task.trace_context().traceparent()}});
+            log_event("attempt_executed", {{"attempt_id", task.attempt_id()}, {"run_id", task.run_id()}, {"invocation_id", task.invocation_id()}, {"worker_pid", result.value("worker_pid", 0)}, {"zygote_pid", result.value("zygote_pid", 0)}, {"warm", result.value("warm", false)}, {"status", result.value("status", "CRASHED")}, {"duration_ms", completion.duration_ms()}, {"traceparent", task.trace_context().traceparent()}});
         } catch (const std::exception& e) { completion.set_final_status(pb::ATTEMPT_STATUS_INFRA_ERROR); completion.clear_output(); completion.set_error_message(std::string(e.what()).substr(0, 4096)); log_event("attempt_error", {{"attempt_id", task.attempt_id()}, {"error", e.what()}}); }
         catch (...) { completion.set_error_message("unknown runner error"); }
         try {
@@ -131,7 +132,7 @@ public:
             for (;;) {
                 attempts_.reap(); signalfd_siginfo info;
                 if (!draining && read(signal_fd, &info, sizeof(info)) == sizeof(info)) { draining = true; policy_ = pb::RUNNER_POLICY_DRAINING; stop_at = now_ms() + config_.grace_ms; log_event("runner_draining"); }
-                if (policy_ == pb::RUNNER_POLICY_OFFLINE) { draining = true; stop_at = now_ms(); }
+                if (workers_.disconnected() || policy_ == pb::RUNNER_POLICY_OFFLINE) { draining = true; stop_at = now_ms(); }
                 auto active = attempts_.snapshot(); if (draining && (active.empty() || now_ms() >= stop_at)) { for (auto& attempt : active) revoke(attempt, "shutdown grace exceeded"); if (active.empty()) break; }
                 if (draining || policy_ != pb::RUNNER_POLICY_ACTIVE || active.size() >= static_cast<size_t>(config_.slots)) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
                 if (!has_pending_request) {

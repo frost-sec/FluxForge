@@ -1,241 +1,526 @@
-#include "fluxforge/ipc.hpp"
+#include "fluxforge/zygote_ipc.hpp"
 #include <sys/epoll.h>
-#include <sys/timerfd.h>
-#include <sys/signalfd.h>
-#include <sys/wait.h>
-#include <sys/resource.h>
 #include <sys/prctl.h>
-#include <sys/syscall.h>
-#include <signal.h>
+#include <sys/signalfd.h>
+#include <sys/timerfd.h>
+#include <sys/wait.h>
+#include <iostream>
+#include <set>
 #include <unordered_map>
 #include <vector>
-#include <deque>
-#include <iostream>
 
 namespace {
-struct Peer { ff::ipc::Decoder decoder; std::string pending; };
-struct Worker {
-    pid_t pid{}; int fd{-1}, log_fd{-1}; std::string key, log;
-    bool ready = false, used = false; int calls = 0;
-    uint64_t generation = 0;
-    uint64_t memory_limit = 256ULL * 1024 * 1024;
-    int64_t started_at = 0;
-    std::string prepared_attempt;
-    int64_t born = ff::now_ms(), last_used = born, deadline = born + 10000;
-    ff::json request;
+using ff::json;
+using ff::now_ms;
+using namespace ff::zygote;
+
+struct Peer {
+    Fd socket, pidfd, logs;
+    ff::ipc::Decoder decoder;
+    std::string outgoing, log_tail;
+
+    int fd() const { return socket.get(); }
 };
+struct Seed {
+    Peer peer;
+    std::string key, affinity_key;
+    pid_t pid = 0;
+    int64_t last_used = now_ms();
+};
+enum class Phase { WaitingForSeed, Forking, Prepared, Running };
+struct Attempt {
+    Peer peer;
+    std::array<Fd, 2> launch_fds;
+    int seed_fd = -1;
+    bool warm = false;
+    pid_t pid = 0;
+    uint64_t generation = 0;
+    Phase phase = Phase::WaitingForSeed;
+    int64_t deadline = 0;
+    int64_t started = 0;
+    json request;
+};
+
 class Host {
-    int agent_, epoll_, timer_, signals_, capacity_;
-    std::string executable_;
-    std::unordered_map<int, Peer> peers_;
-    std::unordered_map<int, Worker> workers_;
-    std::unordered_map<int, int> log_workers_;
-    std::deque<ff::json> waiting_;
+    Peer agent_;
+    Fd epoll_, timer_, signals_, base_control_;
+    pid_t base_pid_ = -1;
+    size_t capacity_;
     bool running_ = true;
     uint64_t next_generation_ = 1;
-    void watch(int fd, uint32_t events = EPOLLIN | EPOLLRDHUP) { epoll_event event{}; event.events = events; event.data.fd = fd; if (epoll_ctl(epoll_, EPOLL_CTL_ADD, fd, &event) < 0) throw std::runtime_error("epoll add failed"); }
-    void flush(int fd) {
-        auto it = peers_.find(fd); if (it == peers_.end()) return;
-        auto& bytes = it->second.pending;
-        while (!bytes.empty()) {
-            auto n = ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+    std::unordered_map<int, Seed> seeds_;
+    std::unordered_map<int, Attempt> attempts_;
+    std::unordered_map<int, int> log_owners_;
+    // epoll_wait may have already returned events for a retired descriptor.
+    // Delay close until this batch ends so the descriptor cannot be reused.
+    std::vector<Fd> retired_;
+
+    void add(int fd, uint32_t flags) {
+        epoll_event event{};
+        event.events = flags;
+        event.data.fd = fd;
+        if (epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, fd, &event) < 0)
+            throw std::runtime_error("epoll add failed");
+    }
+
+    void register_peer(Peer& peer) {
+        ff::ipc::nonblocking(peer.fd());
+        add(peer.fd(), EPOLLIN | EPOLLRDHUP);
+        if (peer.logs) {
+            add(peer.logs.get(), EPOLLIN);
+            log_owners_.emplace(peer.logs.get(), peer.fd());
+        }
+    }
+
+    void retire(Fd& fd) {
+        if (!fd) return;
+        epoll_ctl(epoll_.get(), EPOLL_CTL_DEL, fd.get(), nullptr);
+        retired_.push_back(std::move(fd));
+    }
+
+    void retire_peer(Peer& peer) {
+        log_owners_.erase(peer.logs.get());
+        retire(peer.logs);
+        // Shutdown also revokes a child which has not received its launch grant.
+        shutdown(peer.fd(), SHUT_RDWR);
+        retire(peer.socket);
+    }
+
+    void flush(Peer& peer) {
+        while (!peer.outgoing.empty()) {
+            auto n = send(peer.fd(), peer.outgoing.data(), peer.outgoing.size(), MSG_NOSIGNAL);
             if (n < 0 && errno == EINTR) continue;
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            if (n <= 0) { if (fd == agent_) running_ = false; return; }
-            bytes.erase(0, n);
-        }
-        epoll_event event{}; event.data.fd = fd; event.events = EPOLLIN | EPOLLRDHUP | (bytes.empty() ? 0 : EPOLLOUT); epoll_ctl(epoll_, EPOLL_CTL_MOD, fd, &event);
-    }
-    void send(int fd, ff::json value) {
-        auto& bytes = peers_.at(fd).pending;
-        auto frame = ff::ipc::frame(std::move(value));
-        if (bytes.size() + frame.size() > 2 * ff::ipc::max_frame) throw std::runtime_error("IPC send backlog exceeded");
-        bytes += frame; flush(fd);
-    }
-    void finish(Worker& w, ff::json result) {
-        if (w.request.is_null()) return;
-        result["id"] = w.request.at("id"); result["attempt_id"] = w.request.at("attempt_id");
-        result["warm"] = w.used; result["worker_pid"] = w.pid; result["generation"] = w.generation;
-        if (!w.log.empty()) result["log_tail"] = w.log.substr(0, 8192);
-        send(agent_, std::move(result));
-        w.request = nullptr; w.prepared_attempt.clear(); w.used = true; ++w.calls; w.last_used = ff::now_ms(); w.deadline = 0; w.started_at = 0;
-    }
-    void terminate(int fd, const std::string& status, const std::string& error) {
-        auto it = workers_.find(fd); if (it == workers_.end()) return;
-        auto& w = it->second;
-        const auto duration = w.started_at ? ff::now_ms() - w.started_at : 0;
-        finish(w, {{"op", "result"}, {"status", status}, {"error", error}, {"duration_ms", duration}});
-        kill(-w.pid, SIGKILL); w.ready = false; w.deadline = 0;
-    }
-    static void limit(int resource, rlim_t value) { rlimit lim{value, value}; if (setrlimit(resource, &lim) < 0) _exit(126); }
-    int spawn(const ff::json& request) {
-        int sockets[2], logs[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) || pipe2(logs, O_CLOEXEC)) throw std::runtime_error("worker pipe creation failed");
-        const auto library = request.at("library_path").get<std::string>();
-        const auto memory = request.value("memory_limit_bytes", 256ULL * 1024 * 1024);
-        auto pid = fork();
-        if (pid == 0) {
-            setpgid(0, 0); prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-            if (dup2(logs[1], STDOUT_FILENO) < 0 || dup2(logs[1], STDERR_FILENO) < 0 || dup2(sockets[1], 3) < 0) _exit(126);
-            fcntl(3, F_SETFD, 0);
-            limit(RLIMIT_AS, memory); limit(RLIMIT_NOFILE, 64); limit(RLIMIT_CORE, 0); limit(RLIMIT_FSIZE, request.value("max_payload_bytes", 64ULL * 1024 * 1024));
-            // This process is single-threaded and never initializes gRPC or loads user libraries.
-#ifdef SYS_close_range
-            syscall(SYS_close_range, 4u, ~0u, 0u);
-#else
-            for (int fd = 4; fd < 4096; ++fd) close(fd);
-#endif
-            char* args[] = {const_cast<char*>(executable_.c_str()), const_cast<char*>("3"), const_cast<char*>(library.c_str()), nullptr};
-            char* environment[] = {const_cast<char*>("PATH=/usr/bin:/bin"), const_cast<char*>("LANG=C.UTF-8"), nullptr};
-            execve(executable_.c_str(), args, environment); _exit(127);
-        }
-        close(sockets[1]); close(logs[1]);
-        if (pid < 0) { close(sockets[0]); close(logs[0]); throw std::runtime_error("fork failed"); }
-        setpgid(pid, pid); ff::ipc::nonblocking(sockets[0]); ff::ipc::nonblocking(logs[0]);
-        Worker w; w.pid = pid; w.fd = sockets[0]; w.log_fd = logs[0]; w.key = request.at("affinity_key"); w.request = request; w.generation = next_generation_++; w.memory_limit=memory;
-        w.deadline = ff::now_ms() + request.value("prepare_timeout_ms", 10000LL);
-        peers_.emplace(w.fd, Peer{}); log_workers_[w.log_fd] = w.fd;
-        watch(w.fd); watch(w.log_fd, EPOLLIN | EPOLLHUP); workers_.emplace(w.fd, std::move(w));
-        return sockets[0];
-    }
-    void invoke(ff::json request) {
-        int selected = -1;
-        for (const auto& [fd, w] : workers_) if (w.ready && w.request.is_null() && w.key == request.at("affinity_key") &&
-            (w.prepared_attempt.empty() || w.prepared_attempt == request.at("attempt_id"))) { selected = fd; break; }
-        if (selected < 0 && workers_.size() >= static_cast<size_t>(capacity_)) {
-            bool evicting = false;
-            for (const auto& [fd, w] : workers_) if (w.ready && w.request.is_null() && w.prepared_attempt.empty()) { terminate(fd, "CANCELLED", "cache eviction"); evicting = true; break; }
-            if (evicting) { waiting_.push_back(std::move(request)); return; }
-            reap();
-        }
-        if (selected < 0) {
-            if (workers_.size() >= static_cast<size_t>(capacity_)) { send(agent_, {{"op", "result"}, {"id", request.at("id")}, {"attempt_id", request.at("attempt_id")}, {"status", "RESOURCE_EXHAUSTED"}, {"error", "worker capacity unavailable; retry preparation"}}); return; }
-            spawn(request); return;
-        }
-        auto& w = workers_.at(selected); w.request = std::move(request); w.log.clear();
-        if (w.request.value("op", "") == "prepare") {
-            w.prepared_attempt = w.request.at("attempt_id");
-            send(agent_, {{"id", w.request.at("id")}, {"op", "prepared"}, {"status", "PREPARED"}, {"worker_pid", w.pid}, {"warm", w.used}});
-            w.request = nullptr; w.deadline = ff::now_ms() + 10000; return;
-        }
-        w.started_at = ff::now_ms(); w.prepared_attempt.clear(); w.request["generation"] = w.generation;
-        w.deadline = w.started_at + w.request.value("timeout_ms", 30000LL);
-        send(selected, w.request);
-    }
-    void message(int fd, const ff::json& msg) {
-        if (fd == agent_) {
-            auto op = msg.at("op").get<std::string>();
-            if (op == "invoke" || op == "prepare") invoke(msg);
-            else if (op == "cancel") {
-                for (auto it = waiting_.begin(); it != waiting_.end();) { if (it->at("attempt_id") == msg.at("attempt_id")) { send(agent_, {{"id", it->at("id")}, {"op", "result"}, {"status", "CANCELLED"}, {"error", "preparation cancelled"}}); it = waiting_.erase(it); } else ++it; }
-                for (auto& [worker_fd, w] : workers_) if ((!w.request.is_null() && w.request.at("attempt_id") == msg.at("attempt_id")) || w.prepared_attempt == msg.at("attempt_id")) { terminate(worker_fd, "CANCELLED", msg.value("reason", "cancelled")); w.prepared_attempt.clear(); }
-            } else if (op == "shutdown") running_ = false;
-            else if (op == "stats") {
-                ff::json keys = ff::json::array(); uint64_t rss = 0;
-                for (const auto& [worker_fd, w] : workers_) {
-                    if (w.ready) keys.push_back(w.key);
-                    std::ifstream stat("/proc/" + std::to_string(w.pid) + "/statm"); uint64_t pages, resident;
-                    if (stat >> pages >> resident) rss += resident * static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-                }
-                send(agent_, {{"id", msg.at("id")}, {"op", "stats"}, {"affinity_keys", keys}, {"worker_rss_bytes", rss}, {"workers", workers_.size()}});
+            if (n <= 0) {
+                if (&peer == &agent_) { running_ = false; return; }
+                throw std::runtime_error("worker IPC send failed");
             }
-            else throw std::runtime_error("unknown host operation");
-            return;
+            peer.outgoing.erase(0, n);
         }
-        auto it = workers_.find(fd); if (it == workers_.end()) return;
-        auto& w = it->second; auto op = msg.at("op").get<std::string>();
-        if (op == "ready") {
-            w.ready = true;
-            if (!w.request.is_null()) {
-                if (w.request.value("op", "") == "prepare") {
-                    w.prepared_attempt = w.request.at("attempt_id");
-                    send(agent_, {{"id", w.request.at("id")}, {"op", "prepared"}, {"status", "PREPARED"}, {"worker_pid", w.pid}, {"warm", w.used}});
-                    w.request = nullptr; w.deadline = ff::now_ms() + 10000;
-                } else { w.started_at = ff::now_ms(); w.request["generation"] = w.generation; w.deadline = w.started_at + w.request.value("timeout_ms", 30000LL); send(fd, w.request); }
-            }
-        }
-        else if (op == "result" && !w.request.is_null() && msg.at("attempt_id") == w.request.at("attempt_id") && msg.value("generation", 0ULL) == w.generation) {
-            auto status = msg.value("status", "CRASHED"); finish(w, msg);
-            if (status != "SUCCESS" || w.calls >= 1000 || ff::now_ms() - w.born >= 600000) terminate(fd, "CANCELLED", "worker recycling");
-        } else throw std::runtime_error("invalid worker response");
+        epoll_event event{};
+        event.events = EPOLLIN | EPOLLRDHUP;
+        if (!peer.outgoing.empty()) event.events |= EPOLLOUT;
+        event.data.fd = peer.fd();
+        epoll_ctl(epoll_.get(), EPOLL_CTL_MOD, peer.fd(), &event);
     }
-    void read_socket(int fd) {
-        char buf[16384];
-        for (;;) {
-            auto n = recv(fd, buf, sizeof(buf), 0);
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-            if (n <= 0) { if (fd == agent_) running_ = false; else {auto it=workers_.find(fd);if(it!=workers_.end())read_log(it->second.log_fd);terminate(fd, "CRASHED", "worker disconnected");} break; }
-            auto& decoder = peers_.at(fd).decoder; decoder.append(buf, n);
-            ff::json msg; while (decoder.next(msg)) message(fd, msg);
-        }
+
+    void reply(Peer& peer, const json& msg) {
+        auto frame = ff::ipc::frame(msg);
+        if (peer.outgoing.size() + frame.size() > 2 * ff::ipc::max_frame)
+            throw std::runtime_error("IPC send backlog exceeded");
+        peer.outgoing += frame;
+        flush(peer);
     }
-    void read_log(int fd) {
-        auto it = log_workers_.find(fd); if (it == log_workers_.end()) return;
-        auto worker = workers_.find(it->second); if (worker == workers_.end()) return;
+
+    void read_log(Peer& peer) {
+        if (!peer.logs) return;
         char buf[4096];
         size_t drained = 0;
-        while (drained < 65536) { auto n = read(fd, buf, sizeof(buf)); if (n < 0 && errno == EINTR) continue; if (n <= 0) break; drained += n; auto& log = worker->second.log; if (log.size() < 8192) log.append(buf, std::min<size_t>(n, 8192 - log.size())); }
+        while (drained < 65536) {
+            auto n = read(peer.logs.get(), buf, sizeof(buf));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                if (n == 0) {
+                    log_owners_.erase(peer.logs.get());
+                    retire(peer.logs);
+                }
+                break;
+            }
+            drained += n;
+            peer.log_tail.append(buf, n);
+            if (peer.log_tail.size() > 8192) peer.log_tail.erase(0, peer.log_tail.size() - 8192);
+        }
     }
-    void reap() {
-        int status; pid_t pid;
-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            for (auto it = workers_.begin(); it != workers_.end(); ++it) if (it->second.pid == pid) {
-                const int fd = it->first;
-                try { read_socket(fd); read_log(it->second.log_fd); } catch (...) {}
-                finish(it->second, {{"op", "result"}, {"status", "CRASHED"}, {"error", "worker exited (status " + std::to_string(status) + ")"}});
-                close(it->second.log_fd); log_workers_.erase(it->second.log_fd); close(fd); peers_.erase(fd); workers_.erase(it); break;
+
+    void finish_attempt(int fd, json result, bool kill) {
+        auto& attempt = attempts_.at(fd);
+        if (kill) kill_child(attempt.peer.pidfd);
+        read_log(attempt.peer);
+        auto seed = seeds_.find(attempt.seed_fd);
+        if (seed != seeds_.end()) seed->second.last_used = now_ms();
+        if (attempt.phase != Phase::Prepared) {
+            result["id"] = attempt.request.at("id");
+            result["attempt_id"] = attempt.request.at("attempt_id");
+            result["worker_pid"] = attempt.pid;
+            result["zygote_pid"] = seed == seeds_.end() ? 0 : seed->second.pid;
+            result["warm"] = attempt.warm;
+            result["generation"] = attempt.generation;
+            if (!attempt.peer.log_tail.empty()) result["log_tail"] = attempt.peer.log_tail;
+            reply(agent_, result);
+        }
+        retire_peer(attempt.peer);
+        attempts_.erase(fd);
+    }
+
+    void fail_attempt(int fd, const std::string& status, const std::string& error) {
+        auto start = attempts_.at(fd).started;
+        finish_attempt(fd, {{"op", "result"}, {"status", status}, {"error", error},
+                            {"duration_ms", start ? now_ms() - start : 0}}, true);
+    }
+
+    std::vector<int> attached(int seed_fd) const {
+        std::vector<int> fds;
+        for (const auto& [fd, attempt] : attempts_) {
+            if (attempt.seed_fd == seed_fd) fds.push_back(fd);
+        }
+        return fds;
+    }
+
+    void remove_seed(int fd, const std::string& reason) {
+        auto& seed = seeds_.at(fd);
+        kill_child(seed.peer.pidfd);
+        read_log(seed.peer);
+        const std::string error = seed.peer.log_tail.empty() ? reason : reason + ": " + seed.peer.log_tail;
+        for (int attempt : attached(fd)) fail_attempt(attempt, "CRASHED", error);
+        retire_peer(seed.peer);
+        seeds_.erase(fd);
+    }
+
+    int find_or_create_seed(const json& request) {
+        json config{{"library_path", request.at("library_path")},
+                    {"memory_limit_bytes", request.value("memory_limit_bytes", 256ULL * 1024 * 1024)},
+                    {"max_payload_bytes", request.value("max_payload_bytes", 64ULL * 1024 * 1024)}};
+        auto key = json::array({request.at("affinity_key"), config}).dump();
+        int victim = -1;
+        for (const auto& [fd, seed] : seeds_) {
+            if (seed.key == key) return fd;
+            if (attached(fd).empty() && (victim < 0 || seed.last_used < seeds_.at(victim).last_used)) victim = fd;
+        }
+        if (seeds_.size() >= capacity_) {
+            if (victim < 0) throw std::runtime_error("function zygote capacity unavailable");
+            remove_seed(victim, "zygote eviction");
+        }
+
+        auto sockets = socket_pair(SOCK_SEQPACKET);
+        auto logs = log_pipe();
+        const int fd = sockets[0].get();
+        const std::array descriptors{sockets[1].get(), logs[1].get()};
+        send_fds(base_control_.get(), config.dump(), descriptors);
+        Seed seed;
+        seed.key = std::move(key);
+        seed.affinity_key = request.at("affinity_key");
+        seed.peer.socket = std::move(sockets[0]);
+        seed.peer.logs = std::move(logs[0]);
+        register_peer(seed.peer);
+        seeds_.emplace(fd, std::move(seed));
+        return fd;
+    }
+
+    void fork_worker(Attempt& attempt) {
+        const std::array descriptors{attempt.launch_fds[0].get(), attempt.launch_fds[1].get()};
+        send_fds(attempt.seed_fd, "fork", descriptors);
+        attempt.launch_fds = {};
+        attempt.phase = Phase::Forking;
+    }
+
+    void start_execution(Attempt& attempt, json request) {
+        attempt.phase = Phase::Running;
+        attempt.started = now_ms();
+        attempt.deadline = attempt.started + request.value("timeout_ms", 30000LL);
+        request["generation"] = attempt.generation;
+        attempt.request = std::move(request);
+        reply(attempt.peer, attempt.request);
+    }
+
+    void request_worker(const json& request) {
+        const auto accepted_at = now_ms();
+        const auto& attempt_id = request.at("attempt_id");
+        const bool prepare = request.at("op") == "prepare";
+        for (auto& [fd, attempt] : attempts_) {
+            if (attempt.request.at("attempt_id") != attempt_id) continue;
+            if (!prepare && attempt.phase == Phase::Prepared) {
+                if (accepted_at >= attempt.deadline) {
+                    attempt.request = request;
+                    attempt.phase = Phase::Forking;
+                    fail_attempt(fd, "TIMEOUT", "prepared worker expired");
+                    return;
+                }
+                try { start_execution(attempt, request); }
+                catch (const std::exception& error) { fail_attempt(fd, "CRASHED", error.what()); }
+                return;
+            }
+            reply(agent_, {{"op", "result"}, {"id", request.at("id")}, {"status", "RESOURCE_EXHAUSTED"},
+                           {"error", "attempt already owns a worker"}});
+            return;
+        }
+
+        if (!prepare && request.value("require_prepared", false)) {
+            reply(agent_, {{"op", "result"}, {"id", request.at("id")}, {"status", "CRASHED"},
+                           {"error", "prepared worker no longer exists"}});
+            return;
+        }
+        if (attempts_.size() >= capacity_) {
+            reply(agent_, {{"op", "result"}, {"id", request.at("id")}, {"status", "RESOURCE_EXHAUSTED"},
+                           {"error", "worker capacity unavailable"}});
+            return;
+        }
+
+        int fd = -1;
+        try {
+            int seed_fd = find_or_create_seed(request);
+            auto sockets = socket_pair(SOCK_STREAM);
+            auto logs = log_pipe();
+            Attempt attempt;
+            attempt.seed_fd = seed_fd;
+            attempt.warm = seeds_.at(seed_fd).pid > 0;
+            attempt.generation = next_generation_++;
+            attempt.deadline = accepted_at + request.value("prepare_timeout_ms", 10000LL);
+            attempt.request = request;
+            attempt.peer.socket = std::move(sockets[0]);
+            attempt.peer.logs = std::move(logs[0]);
+            attempt.launch_fds = {std::move(sockets[1]), std::move(logs[1])};
+            const int candidate = attempt.peer.fd();
+            register_peer(attempt.peer);
+            attempts_.emplace(candidate, std::move(attempt));
+            fd = candidate;
+            if (attempts_.at(fd).warm) fork_worker(attempts_.at(fd));
+        } catch (const std::exception& error) {
+            if (fd >= 0) fail_attempt(fd, "CRASHED", error.what());
+            else reply(agent_, {{"op", "result"}, {"id", request.at("id")}, {"status", "RESOURCE_EXHAUSTED"}, {"error", error.what()}});
+        }
+    }
+
+    void seed_message(int fd, const json& msg) {
+        auto& seed = seeds_.at(fd);
+        if (msg.at("op") != "ready" || seed.pid || msg.at("zygote_pid").get<pid_t>() <= 0)
+            throw std::runtime_error("invalid function zygote response");
+        seed.pid = msg.at("zygote_pid");
+        for (int worker_fd : attached(fd)) {
+            if (now_ms() >= attempts_.at(worker_fd).deadline) {
+                fail_attempt(worker_fd, "TIMEOUT", "worker preparation timed out");
+                continue;
+            }
+            try { fork_worker(attempts_.at(worker_fd)); }
+            catch (const std::exception& error) { fail_attempt(worker_fd, "CRASHED", error.what()); }
+        }
+    }
+
+    void worker_message(int fd, const json& msg) {
+        auto& attempt = attempts_.at(fd);
+        if (msg.at("op") == "ready" && attempt.phase == Phase::Forking) {
+            attempt.pid = msg.at("worker_pid");
+            if (now_ms() >= attempt.deadline) {
+                fail_attempt(fd, "TIMEOUT", "worker preparation timed out");
+                return;
+            }
+            if (attempt.request.at("op") != "prepare") {
+                start_execution(attempt, attempt.request);
+                return;
+            }
+            attempt.phase = Phase::Prepared;
+            attempt.deadline = now_ms() + 10000;
+            reply(agent_, {{"op", "prepared"}, {"id", attempt.request.at("id")}, {"status", "PREPARED"},
+                           {"worker_pid", attempt.pid}, {"zygote_pid", seeds_.at(attempt.seed_fd).pid},
+                           {"warm", attempt.warm}});
+            return;
+        }
+        if (msg.at("op") != "result" || attempt.phase != Phase::Running ||
+            msg.at("id") != attempt.request.at("id") || msg.at("attempt_id") != attempt.request.at("attempt_id") ||
+            msg.value("generation", 0ULL) != attempt.generation)
+            throw std::runtime_error("invalid one-shot worker response");
+        if (now_ms() >= attempt.deadline) {
+            fail_attempt(fd, "TIMEOUT", "function execution timed out");
+            return;
+        }
+        finish_attempt(fd, msg, false);
+    }
+
+    void stats(const json& msg) {
+        std::set<std::string> keys;
+        uint64_t rss = 0;
+        auto add_rss = [&rss](pid_t pid) {
+            if (pid <= 0) return;
+            uint64_t pages, resident;
+            std::ifstream stat("/proc/" + std::to_string(pid) + "/statm");
+            if (stat >> pages >> resident) rss += resident * sysconf(_SC_PAGESIZE);
+        };
+        for (const auto& [fd, seed] : seeds_) {
+            if (seed.pid > 0) keys.insert(seed.affinity_key);
+            add_rss(seed.pid);
+        }
+        for (const auto& [fd, attempt] : attempts_) add_rss(attempt.pid);
+        reply(agent_, {{"op", "stats"}, {"id", msg.at("id")}, {"affinity_keys", keys},
+                       {"worker_rss_bytes", rss}, {"workers", attempts_.size()}, {"zygotes", seeds_.size()},
+                       {"base_pid", base_pid_}});
+    }
+
+    void agent_message(const json& msg) {
+        auto op = msg.at("op").get<std::string>();
+        if (op == "prepare" || op == "invoke") request_worker(msg);
+        else if (op == "stats") stats(msg);
+        else if (op == "shutdown") running_ = false;
+        else if (op == "cancel") {
+            for (const auto& [fd, attempt] : attempts_) {
+                if (attempt.request.at("attempt_id") != msg.at("attempt_id")) continue;
+                fail_attempt(fd, "CANCELLED", msg.value("reason", "cancelled"));
+                break;
+            }
+            evict_idle_seeds();
+        } else throw std::runtime_error("unknown host operation");
+    }
+
+    Peer* peer(int fd) {
+        if (fd == agent_.fd()) return &agent_;
+        if (auto it = attempts_.find(fd); it != attempts_.end()) return &it->second.peer;
+        if (auto it = seeds_.find(fd); it != seeds_.end()) return &it->second.peer;
+        return nullptr;
+    }
+
+    void read_peer(int fd) {
+        auto* connection = peer(fd);
+        if (fd != agent_.fd() && !connection->pidfd && !allow_launch(fd, connection->pidfd)) return;
+        char buf[16384];
+        size_t received = 0;
+        while (received < 65536 && running_) {
+            auto n = recv(fd, buf, sizeof(buf), 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+            if (n <= 0) {
+                if (fd == agent_.fd()) { running_ = false; return; }
+                throw std::runtime_error("zygote or worker disconnected");
+            }
+            received += n;
+            connection->decoder.append(buf, n);
+            json msg;
+            while (connection->decoder.next(msg)) {
+                if (fd == agent_.fd()) agent_message(msg);
+                else if (seeds_.contains(fd)) seed_message(fd, msg);
+                else worker_message(fd, msg);
+                if (!peer(fd) || !running_) return;
             }
         }
-        while (!waiting_.empty() && workers_.size() < static_cast<size_t>(capacity_)) { auto request = std::move(waiting_.front()); waiting_.pop_front(); spawn(request); }
     }
+
+    void reap() {
+        pid_t pid;
+        while ((pid = waitpid(-1, nullptr, WNOHANG)) > 0) {
+            if (pid == base_pid_) {
+                base_pid_ = -1;
+                running_ = false;
+            }
+        }
+    }
+
+    void evict_idle_seeds() {
+        const auto now = now_ms();
+        std::vector<int> evict;
+        for (const auto& [fd, seed] : seeds_) {
+            if ((!seed.pid || now - seed.last_used >= 60000) && attached(fd).empty())
+                evict.push_back(fd);
+        }
+        for (int fd : evict) remove_seed(fd, "idle zygote eviction");
+    }
+
+    void tick() {
+        uint64_t ticks;
+        if (read(timer_.get(), &ticks, sizeof(ticks)) != sizeof(ticks)) return;
+        const auto now = now_ms();
+        std::vector<int> expired;
+        for (const auto& [fd, attempt] : attempts_) {
+            if (now >= attempt.deadline) expired.push_back(fd);
+        }
+        for (int fd : expired) {
+            const auto phase = attempts_.at(fd).phase;
+            const auto* error = phase == Phase::Running ? "function execution timed out" : "worker preparation timed out";
+            fail_attempt(fd, "TIMEOUT", error);
+        }
+        evict_idle_seeds();
+        reap();
+    }
+
+    void start_base(const std::string& executable) {
+        auto sockets = socket_pair(SOCK_SEQPACKET);
+        auto parent = getpid();
+        base_pid_ = fork();
+        if (base_pid_ < 0) throw std::runtime_error("base zygote fork failed");
+        if (base_pid_ == 0) {
+            if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent ||
+                prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+                dup2(sockets[1].get(), 3) < 0 || fcntl(3, F_SETFD, 0) < 0) _exit(126);
+            // Close every inherited descriptor, including the Agent channel.
+            if (syscall(SYS_close_range, 4u, ~0u, 0u) < 0) _exit(126);
+            char* args[] = {const_cast<char*>(executable.c_str()), const_cast<char*>("3"),
+                            const_cast<char*>("--base-zygote"), nullptr};
+            char* env[] = {const_cast<char*>("PATH=/usr/bin:/bin"), const_cast<char*>("LANG=C.UTF-8"), nullptr};
+            execve(executable.c_str(), args, env);
+            _exit(127);
+        }
+        base_control_ = std::move(sockets[0]);
+    }
+
 public:
-    Host(int agent, int capacity, std::string executable) : agent_(agent), capacity_(capacity), executable_(std::move(executable)) {
-        sigset_t mask; sigemptyset(&mask); sigaddset(&mask, SIGCHLD); sigaddset(&mask, SIGTERM); sigaddset(&mask, SIGINT); pthread_sigmask(SIG_BLOCK, &mask, nullptr);
-        prctl(PR_SET_CHILD_SUBREAPER, 1);
-        epoll_ = epoll_create1(EPOLL_CLOEXEC); signals_ = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC); timer_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-        if (epoll_ < 0 || signals_ < 0 || timer_ < 0) throw std::runtime_error("cannot initialize Linux reactor");
-        itimerspec timer{}; timer.it_value.tv_nsec = 50000000; timer.it_interval = timer.it_value; timerfd_settime(timer_, 0, &timer, nullptr);
-        ff::ipc::nonblocking(agent_); peers_.emplace(agent_, Peer{}); watch(agent_); watch(signals_); watch(timer_);
+    Host(int agent, int capacity) : capacity_(capacity) {
+        agent_.socket = Fd(agent);
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGCHLD);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGINT);
+        if (capacity <= 0 || sigprocmask(SIG_BLOCK, &mask, nullptr) < 0 ||
+            prctl(PR_SET_CHILD_SUBREAPER, 1) < 0) throw std::runtime_error("cannot initialize worker host");
+        epoll_ = Fd(epoll_create1(EPOLL_CLOEXEC));
+        signals_ = Fd(signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC));
+        timer_ = Fd(timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC));
+        if (!epoll_ || !signals_ || !timer_) throw std::runtime_error("cannot initialize Linux reactor");
+        itimerspec timer{};
+        timer.it_value.tv_nsec = 50000000;
+        timer.it_interval = timer.it_value;
+        if (timerfd_settime(timer_.get(), 0, &timer, nullptr) < 0) throw std::runtime_error("cannot arm host timer");
+        register_peer(agent_);
+        add(signals_.get(), EPOLLIN);
+        add(timer_.get(), EPOLLIN);
     }
+
     ~Host() {
-        for (auto& [fd, w] : workers_) kill(-w.pid, SIGKILL);
+        for (const auto& [fd, attempt] : attempts_) kill_child(attempt.peer.pidfd);
+        for (const auto& [fd, seed] : seeds_) kill_child(seed.peer.pidfd);
+        if (base_pid_ > 0) kill(base_pid_, SIGKILL);
         while (waitpid(-1, nullptr, 0) > 0 || errno == EINTR) {}
-        for (auto& [fd, w] : workers_) { close(fd); close(w.log_fd); }
-        close(agent_); close(timer_); close(signals_); close(epoll_);
     }
-    void run() {
+
+    void run(const std::string& executable) {
+        start_base(executable);
+        // Descriptor transfer must never block the supervisor's timers.
+        ff::ipc::nonblocking(base_control_.get());
         epoll_event events[32];
         while (running_) {
-            auto count = epoll_wait(epoll_, events, 32, -1); if (count < 0 && errno == EINTR) continue; if (count < 0) throw std::runtime_error("epoll wait failed");
-            for (int i = 0; i < count; ++i) {
+            auto count = epoll_wait(epoll_.get(), events, 32, -1);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) throw std::runtime_error("epoll wait failed");
+            for (int i = 0; i < count && running_; ++i) {
                 const int fd = events[i].data.fd;
-                if (fd == signals_) { signalfd_siginfo info; while (read(fd, &info, sizeof(info)) == sizeof(info)) { if (info.ssi_signo == SIGCHLD) reap(); else running_ = false; } }
-                else if (fd == timer_) {
-                    uint64_t ticks=0; const auto received=read(fd,&ticks,sizeof(ticks)); if(received!=sizeof(ticks)) continue;
-                    const auto now=ff::now_ms();
-                    for(auto& [worker_fd,w]:workers_){
-                        if(w.deadline && now>=w.deadline) terminate(worker_fd,"TIMEOUT",w.ready?"function execution timed out":"worker preparation timed out");
-                        else if(w.ready && w.request.is_null() && w.prepared_attempt.empty()){
-                            uint64_t pages=0,resident=0;std::ifstream stat("/proc/"+std::to_string(w.pid)+"/statm");stat>>pages>>resident;
-                            const auto rss=resident*static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
-                            if(rss>w.memory_limit*3/4)terminate(worker_fd,"CANCELLED","idle RSS recycling");
-                            else if(now-w.last_used>60000)terminate(worker_fd,"CANCELLED","idle eviction");
-                        }
+                if (fd == signals_.get()) {
+                    signalfd_siginfo info;
+                    while (read(fd, &info, sizeof(info)) == sizeof(info)) {
+                        if (info.ssi_signo == SIGCHLD) reap();
+                        else running_ = false;
                     }
-                    reap();
-                }
-                else if (log_workers_.count(fd)) read_log(fd);
-                else if (peers_.count(fd)) {
-                    try { if (events[i].events & EPOLLOUT) flush(fd); if (events[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) read_socket(fd); }
-                    catch (const std::exception& e) { if (fd == agent_) throw; terminate(fd, "CRASHED", e.what()); }
+                } else if (fd == timer_.get()) tick();
+                else if (auto it = log_owners_.find(fd); it != log_owners_.end()) read_log(*peer(it->second));
+                else if (auto* connection = peer(fd)) {
+                    try {
+                        if (events[i].events & EPOLLOUT) flush(*connection);
+                        if (events[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) read_peer(fd);
+                    } catch (const std::exception& error) {
+                        if (fd == agent_.fd()) throw;
+                        if (seeds_.contains(fd)) remove_seed(fd, error.what());
+                        else if (attempts_.contains(fd)) fail_attempt(fd, "CRASHED", error.what());
+                    }
                 }
             }
+            retired_.clear();
         }
     }
 };
 }
 int main(int argc, char** argv) {
-    try { if (argc != 4) throw std::runtime_error("usage: fluxforge-worker-host IPC_FD CAPACITY WORKER_EXECUTABLE"); Host host(std::stoi(argv[1]), std::stoi(argv[2]), argv[3]); host.run(); return 0; }
-    catch (const std::exception& e) { std::cerr << "worker-host: " << e.what() << '\n'; return 1; }
+    try {
+        if (argc != 4) throw std::runtime_error("usage: fluxforge-worker-host IPC_FD CAPACITY WORKER_EXECUTABLE");
+        Host host(std::stoi(argv[1]), std::stoi(argv[2]));
+        host.run(argv[3]);
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "worker-host: " << error.what() << '\n';
+        return 1;
+    }
 }

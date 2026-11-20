@@ -18,7 +18,7 @@ inline std::string frame(json message) {
     envelope.set_correlation_id(message.value("id", ""));
     envelope.set_attempt_id(message.value("attempt_id", ""));
     envelope.set_worker_generation(message.value("generation", 0ULL));
-    envelope.set_json_body(message.dump());
+    envelope.set_json_body(message.dump(-1, ' ', false, json::error_handler_t::replace));
     auto body = envelope.SerializeAsString();
     if (body.size() > max_frame) throw std::runtime_error("IPC frame too large");
     uint32_t length = htonl(static_cast<uint32_t>(body.size()));

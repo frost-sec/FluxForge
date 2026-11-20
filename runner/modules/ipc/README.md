@@ -6,6 +6,8 @@ Sources: include/fluxforge/ipc.hpp; proto/worker.proto.
 
 Four-byte network-endian body length followed by WorkerEnvelope protobuf. The envelope carries protocol/correlation/Attempt/generation; the operation-specific body is JSON.
 
+The private Zygote launch channel uses bounded Unix seqpackets with `SCM_RIGHTS` for socket and log descriptors. The new child sends its pidfd over its dedicated channel and waits for Host to grant launch. Worker result frames travel directly to Host over the per-Attempt stream. A closed channel before the grant makes the child exit.
+
 ## Interfaces, dependencies and ownership
 
 Handles split/coalesced frames, short writes, EINTR/EAGAIN and disconnects. Both envelope and body identities must agree; stale Worker generations cannot complete a new Attempt.
